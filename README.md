@@ -36,7 +36,7 @@ It stores message content locally. Do not commit collected messages or your Disc
 - `/delete_db confirm:true` permanently deletes all locally stored messages, prune records, and sync checkpoints. It does not delete Discord messages.
 - `/set_filter min_length:100` temporarily limits replies to stored messages at least 100 characters long. `contains_text` can require a word or phrase. Use `/clear_filter` to restore all stored replies; filters are memory-only and do not modify the database.
 
-Messages are stored locally in `messages.json`, with excluded IDs in `pruned_ids.json` and per-channel sync checkpoints in `sync_state.json`; all are ignored by Git. The bot filters history by `OWNER_USER_ID` and does not save other members' messages.
+Messages, prune records, and per-channel sync checkpoints are stored in the SQLite database `recalled.db`, which is ignored by Git. The bot filters history by `OWNER_USER_ID` and does not save other members' messages.
 
 ## Docker
 
@@ -51,11 +51,11 @@ Stop it with `docker compose down`. The named volume `messages-data` preserves c
 
 ## Publishing safely
 
-Before pushing, confirm `.env`, `messages.json`, and `pruned_ids.json` are not tracked:
+Before pushing, confirm `.env` and `recalled.db` are not tracked:
 
 ```bash
 git status --short
-git ls-files .env messages.json pruned_ids.json
+git ls-files .env recalled.db
 ```
 
 The second command should produce no output. If a token was ever committed, revoke it in the Discord Developer Portal and create a new one; adding it to `.gitignore` does not remove it from Git history.

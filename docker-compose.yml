@@ -4,7 +4,7 @@ services:
     env_file:
       - .env
     environment:
-      DATA_FILE: /app/data/messages.json
+      DATABASE_FILE: /app/data/recalled.db
     volumes:
       - messages-data:/app/data
     restart: unless-stopped

@@ -1,12 +1,12 @@
-import json
 import os
 import random
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 
@@ -15,58 +15,73 @@ load_dotenv()
 TOKEN = os.environ["DISCORD_TOKEN"]
 OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
 KEYWORD = os.getenv("KEYWORD", "").strip().casefold()
-DATA_FILE = Path(os.getenv("DATA_FILE", "messages.json"))
-PRUNED_FILE = DATA_FILE.with_name("pruned_ids.json")
-SYNC_STATE_FILE = DATA_FILE.with_name("sync_state.json")
+DATABASE_FILE = Path(os.getenv("DATABASE_FILE", "recalled.db"))
 GUILD_ID = os.getenv("GUILD_ID")
 
 if not KEYWORD:
     raise RuntimeError("KEYWORD must be set in .env")
 
 
-def load_messages() -> list[dict[str, str]]:
-    if not DATA_FILE.exists():
-        return []
-    with DATA_FILE.open(encoding="utf-8") as file:
-        messages = json.load(file)
-    if not isinstance(messages, list):
-        return []
-    return [
-        {"id": message.get("id", "legacy"), "content": message["content"]}
-        for message in messages
-        if isinstance(message, dict) and isinstance(message.get("content"), str) and message["content"]
-    ]
+def connect_database() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_FILE)
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pruned_messages (
+            id TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS sync_state (
+            channel_id TEXT PRIMARY KEY,
+            checkpoint TEXT NOT NULL
+        );
+        """
+    )
+    connection.commit()
+    return connection
 
 
-def save_messages(messages: list[dict[str, str]]) -> None:
-    with DATA_FILE.open("w", encoding="utf-8") as file:
-        json.dump(messages, file, ensure_ascii=False, indent=2)
+def load_messages(connection: sqlite3.Connection) -> list[dict[str, str]]:
+    rows = connection.execute("SELECT id, content FROM messages ORDER BY rowid").fetchall()
+    return [{"id": row["id"], "content": row["content"]} for row in rows]
 
 
-def load_pruned_ids() -> set[str]:
-    if not PRUNED_FILE.exists():
-        return set()
-    with PRUNED_FILE.open(encoding="utf-8") as file:
-        ids = json.load(file)
-    return {str(message_id) for message_id in ids} if isinstance(ids, list) else set()
+def load_pruned_ids(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute("SELECT id FROM pruned_messages").fetchall()
+    return {row["id"] for row in rows}
 
 
-def save_pruned_ids(message_ids: set[str]) -> None:
-    with PRUNED_FILE.open("w", encoding="utf-8") as file:
-        json.dump(sorted(message_ids), file, indent=2)
+def load_sync_state(connection: sqlite3.Connection) -> dict[str, str]:
+    rows = connection.execute("SELECT channel_id, checkpoint FROM sync_state").fetchall()
+    return {row["channel_id"]: row["checkpoint"] for row in rows}
 
 
-def load_sync_state() -> dict[str, str]:
-    if not SYNC_STATE_FILE.exists():
-        return {}
-    with SYNC_STATE_FILE.open(encoding="utf-8") as file:
-        state = json.load(file)
-    return state if isinstance(state, dict) else {}
+def save_sync_checkpoint(connection: sqlite3.Connection, channel_id: str, checkpoint: str) -> None:
+    connection.execute(
+        "INSERT INTO sync_state(channel_id, checkpoint) VALUES (?, ?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET checkpoint = excluded.checkpoint",
+        (channel_id, checkpoint),
+    )
+    connection.commit()
 
 
-def save_sync_state(state: dict[str, str]) -> None:
-    with SYNC_STATE_FILE.open("w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2)
+def insert_message(connection: sqlite3.Connection, message_id: str, content: str) -> None:
+    connection.execute(
+        "INSERT OR IGNORE INTO messages(id, content) VALUES (?, ?)",
+        (message_id, content),
+    )
+
+
+def delete_messages(connection: sqlite3.Connection, message_ids: set[str]) -> None:
+    connection.executemany("DELETE FROM messages WHERE id = ?", ((message_id,) for message_id in message_ids))
+    connection.executemany(
+        "INSERT OR IGNORE INTO pruned_messages(id) VALUES (?)",
+        ((message_id,) for message_id in message_ids),
+    )
+    connection.commit()
 
 
 NON_NOUN_WORDS = {
@@ -118,9 +133,10 @@ def weighted_reply(query: str) -> str:
     return random.choices(eligible_messages, weights=weights, k=1)[0]["content"]
 
 
-stored_messages = load_messages()
-pruned_ids = load_pruned_ids()
-sync_state = load_sync_state()
+database = connect_database()
+stored_messages = load_messages(database)
+pruned_ids = load_pruned_ids(database)
+sync_state = load_sync_state(database)
 active_sync_channels: set[int] = set()
 sync_stop_requests: set[int] = set()
 response_filter = {"min_length": 0, "contains_text": ""}
@@ -144,7 +160,17 @@ async def setup_hook() -> None:
 
 @bot.event
 async def on_ready() -> None:
+    if not rotate_status.is_running():
+        rotate_status.start()
     print(f"Logged in as {bot.user} with {len(stored_messages)} stored messages.")
+
+
+@tasks.loop(minutes=2)
+async def rotate_status() -> None:
+    if not stored_messages:
+        return
+    status_text = random.choice(stored_messages)["content"].replace("\n", " ").strip()
+    await bot.change_presence(activity=discord.Game(name=status_text[:128]))
 
 
 @bot.tree.command(name="sync", description="Import your messages from this channel")
@@ -211,10 +237,12 @@ async def sync(
             message_id = str(message.id)
             if message.author.id == OWNER_USER_ID and message.content and message_id not in known_ids:
                 stored_messages.append({"id": message_id, "content": message.content})
+                insert_message(database, message_id, message.content)
                 known_ids.add(message_id)
                 imported += 1
             if scanned % 500 == 0:
-                save_sync_state(sync_state)
+                save_sync_checkpoint(database, channel_state_key, sync_state[channel_state_key])
+                database.commit()
                 await interaction.edit_original_response(
                     content=f"Still scanning history... {scanned:,} messages checked, {imported:,} imported."
                 )
@@ -226,8 +254,8 @@ async def sync(
     finally:
         active_sync_channels.discard(channel_id)
 
-    save_messages(stored_messages)
-    save_sync_state(sync_state)
+    save_sync_checkpoint(database, channel_state_key, sync_state.get(channel_state_key, ""))
+    database.commit()
     resume_note = " This channel will resume from this point next time." if stopped or not since_date else ""
     await interaction.followup.send(
         f"{'Stopped after' if stopped else 'Checked'} {scanned:,} message(s), imported {imported:,}, "
@@ -303,8 +331,7 @@ async def prune(
     if not dry_run:
         stored_messages = kept_messages
         pruned_ids.update(removed_ids)
-        save_messages(stored_messages)
-        save_pruned_ids(pruned_ids)
+        delete_messages(database, removed_ids)
 
     action = "would remove" if dry_run else "removed"
     await interaction.followup.send(
@@ -339,8 +366,10 @@ async def delete_db(interaction: discord.Interaction, confirm: bool = False) -> 
     stored_messages = []
     pruned_ids = set()
     sync_state = {}
-    for data_file in (DATA_FILE, PRUNED_FILE, SYNC_STATE_FILE):
-        data_file.unlink(missing_ok=True)
+    database.execute("DELETE FROM messages")
+    database.execute("DELETE FROM pruned_messages")
+    database.execute("DELETE FROM sync_state")
+    database.commit()
 
     await interaction.response.send_message(
         "Deleted all locally stored messages, prune records, and sync checkpoints.",

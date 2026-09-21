@@ -2,6 +2,7 @@ import json
 import os
 import random
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -78,7 +79,15 @@ async def on_ready() -> None:
 
 @bot.tree.command(name="sync", description="Import your messages from this channel")
 @discord.app_commands.guild_only()
-async def sync(interaction: discord.Interaction) -> None:
+@discord.app_commands.describe(
+    after_date="Only import messages after this date, YYYY-MM-DD",
+    before_date="Only import messages before this date, YYYY-MM-DD",
+)
+async def sync(
+    interaction: discord.Interaction,
+    after_date: str | None = None,
+    before_date: str | None = None,
+) -> None:
     """Import the owner's messages from the channel where this command is used."""
     global stored_messages
 
@@ -89,8 +98,33 @@ async def sync(interaction: discord.Interaction) -> None:
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
         await interaction.followup.send("This command must be run in a text channel.")
         return
+
     try:
-        async for message in interaction.channel.history(limit=None, oldest_first=True):
+        after = (
+            datetime.strptime(after_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if after_date
+            else None
+        )
+        before = (
+            datetime.strptime(before_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if before_date
+            else None
+        )
+    except ValueError:
+        await interaction.followup.send("Dates must use YYYY-MM-DD format, for example 2025-01-31.")
+        return
+
+    if after and before and after >= before:
+        await interaction.followup.send("after_date must be earlier than before_date.")
+        return
+
+    try:
+        async for message in interaction.channel.history(
+            limit=None,
+            before=before,
+            after=after,
+            oldest_first=True,
+        ):
             scanned += 1
             message_id = str(message.id)
             if message.author.id == OWNER_USER_ID and message.content and message_id not in known_ids:

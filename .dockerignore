@@ -6,5 +6,6 @@ messages.json
 pruned_ids.json
 sync_state.json
 recalled.db
+recalled.db-*
 .git/
 .vscode/

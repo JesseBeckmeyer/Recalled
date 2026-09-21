@@ -55,6 +55,21 @@ def save_pruned_ids(message_ids: set[str]) -> None:
         json.dump(sorted(message_ids), file, indent=2)
 
 
+def message_words(content: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9']+", content.casefold()))
+
+
+def weighted_reply(query: str) -> str:
+    query_words = message_words(query)
+    weights: list[int] = []
+
+    for message in stored_messages:
+        matching_words = query_words & message_words(message["content"])
+        weights.append(1 + min(len(matching_words), 3))
+
+    return random.choices(stored_messages, weights=weights, k=1)[0]["content"]
+
+
 stored_messages = load_messages()
 pruned_ids = load_pruned_ids()
 intents = discord.Intents.default()
@@ -224,6 +239,6 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if KEYWORD in message.content.casefold() and stored_messages:
-        await message.channel.send(random.choice(stored_messages)["content"])
+        await message.channel.send(weighted_reply(message.content))
 
 bot.run(TOKEN)

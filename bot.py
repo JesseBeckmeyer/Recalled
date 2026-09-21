@@ -17,6 +17,7 @@ OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
 KEYWORD = os.getenv("KEYWORD", "").strip().casefold()
 DATA_FILE = Path(os.getenv("DATA_FILE", "messages.json"))
 PRUNED_FILE = DATA_FILE.with_name("pruned_ids.json")
+SYNC_STATE_FILE = DATA_FILE.with_name("sync_state.json")
 GUILD_ID = os.getenv("GUILD_ID")
 
 if not KEYWORD:
@@ -55,8 +56,21 @@ def save_pruned_ids(message_ids: set[str]) -> None:
         json.dump(sorted(message_ids), file, indent=2)
 
 
+def load_sync_state() -> dict[str, str]:
+    if not SYNC_STATE_FILE.exists():
+        return {}
+    with SYNC_STATE_FILE.open(encoding="utf-8") as file:
+        state = json.load(file)
+    return state if isinstance(state, dict) else {}
+
+
+def save_sync_state(state: dict[str, str]) -> None:
+    with SYNC_STATE_FILE.open("w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
+
+
 NON_NOUN_WORDS = {
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any",
+    "jesse", "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any",
     "are", "aren't", "as", "at", "be", "because", "been", "before", "being", "below",
     "between", "both", "but", "by", "can", "can't", "cannot", "could", "couldn't", "did",
     "didn't", "do", "does", "doesn't", "doing", "don't", "down", "during", "each", "few",
@@ -83,17 +97,33 @@ def message_words(content: str) -> set[str]:
 
 def weighted_reply(query: str) -> str:
     query_words = message_words(query)
+    eligible_messages = [
+        message
+        for message in stored_messages
+        if len(message["content"]) >= response_filter["min_length"]
+        and (
+            not response_filter["contains_text"]
+            or response_filter["contains_text"] in message["content"].casefold()
+        )
+    ]
+    if not eligible_messages:
+        return ""
+
     weights: list[int] = []
 
-    for message in stored_messages:
+    for message in eligible_messages:
         matching_words = query_words & message_words(message["content"])
         weights.append(1 + min(len(matching_words), 3))
 
-    return random.choices(stored_messages, weights=weights, k=1)[0]["content"]
+    return random.choices(eligible_messages, weights=weights, k=1)[0]["content"]
 
 
 stored_messages = load_messages()
 pruned_ids = load_pruned_ids()
+sync_state = load_sync_state()
+active_sync_channels: set[int] = set()
+sync_stop_requests: set[int] = set()
+response_filter = {"min_length": 0, "contains_text": ""}
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -117,13 +147,11 @@ async def on_ready() -> None:
 @bot.tree.command(name="sync", description="Import your messages from this channel")
 @discord.app_commands.guild_only()
 @discord.app_commands.describe(
-    after_date="Only import messages after this date, YYYY-MM-DD",
-    before_date="Only import messages before this date, YYYY-MM-DD",
+    since_date="Scan backward from now to this date, YYYY-MM-DD",
 )
 async def sync(
     interaction: discord.Interaction,
-    after_date: str | None = None,
-    before_date: str | None = None,
+    since_date: str | None = None,
 ) -> None:
     """Import the owner's messages from the channel where this command is used."""
     global stored_messages
@@ -138,37 +166,52 @@ async def sync(
 
     try:
         after = (
-            datetime.strptime(after_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            if after_date
-            else None
-        )
-        before = (
-            datetime.strptime(before_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            if before_date
+            datetime.strptime(since_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if since_date
             else None
         )
     except ValueError:
         await interaction.followup.send("Dates must use YYYY-MM-DD format, for example 2025-01-31.")
         return
 
-    if after and before and after >= before:
-        await interaction.followup.send("after_date must be earlier than before_date.")
+    channel_state_key = str(interaction.channel.id)
+    channel_id = interaction.channel.id
+    if channel_id in active_sync_channels:
+        await interaction.followup.send("A sync is already running in this channel.")
         return
 
+    checkpoint = None if since_date else sync_state.get(channel_state_key)
+    if checkpoint:
+        try:
+            checkpoint_time = datetime.fromisoformat(checkpoint)
+        except ValueError:
+            checkpoint_time = None
+    else:
+        checkpoint_time = None
+
+    active_sync_channels.add(channel_id)
+    stopped = False
     try:
         async for message in interaction.channel.history(
             limit=None,
-            before=before,
+            before=checkpoint_time or datetime.now(timezone.utc),
             after=after,
-            oldest_first=True,
+            oldest_first=False,
         ):
+            if channel_id in sync_stop_requests:
+                sync_stop_requests.remove(channel_id)
+                stopped = True
+                break
+
             scanned += 1
+            sync_state[channel_state_key] = message.created_at.isoformat()
             message_id = str(message.id)
             if message.author.id == OWNER_USER_ID and message.content and message_id not in known_ids:
                 stored_messages.append({"id": message_id, "content": message.content})
                 known_ids.add(message_id)
                 imported += 1
             if scanned % 500 == 0:
+                save_sync_state(sync_state)
                 await interaction.edit_original_response(
                     content=f"Still scanning history... {scanned:,} messages checked, {imported:,} imported."
                 )
@@ -177,18 +220,41 @@ async def sync(
             "I cannot read this channel's history. Grant me View Channel and Read Message History, then try again."
         )
         return
+    finally:
+        active_sync_channels.discard(channel_id)
 
     save_messages(stored_messages)
+    save_sync_state(sync_state)
+    resume_note = " This channel will resume from this point next time." if stopped or not since_date else ""
     await interaction.followup.send(
-        f"Checked {scanned:,} message(s), imported {imported:,}, and now have {len(stored_messages):,} stored messages."
+        f"{'Stopped after' if stopped else 'Checked'} {scanned:,} message(s), imported {imported:,}, "
+        f"and now have {len(stored_messages):,} stored messages."
+        f"{resume_note}"
     )
+
+
+@bot.tree.command(name="stop_sync", description="Stop the active sync in this channel")
+@discord.app_commands.guild_only()
+async def stop_sync(interaction: discord.Interaction) -> None:
+    """Request that the active channel sync stop at its next batch."""
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("Only the configured owner can stop a sync.", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("This command must be run in a text channel.", ephemeral=True)
+        return
+    if interaction.channel.id not in active_sync_channels:
+        await interaction.response.send_message("There is no active sync in this channel.", ephemeral=True)
+        return
+
+    sync_stop_requests.add(interaction.channel.id)
+    await interaction.response.send_message("Stopping the sync after the current batch...", ephemeral=True)
 
 
 @bot.tree.command(name="prune", description="Remove unwanted stored messages")
 @discord.app_commands.describe(
     contains_text="Remove messages containing this text",
     min_length="Remove messages shorter than this many characters",
-    remove_links="Remove messages containing links",
     remove_commands="Remove messages beginning with ! or /",
     remove_duplicates="Keep only the first copy of duplicate text",
     dry_run="Preview the number removed without changing the file",
@@ -197,7 +263,6 @@ async def prune(
     interaction: discord.Interaction,
     contains_text: str | None = None,
     min_length: discord.app_commands.Range[int, 0, 500] = 0,
-    remove_links: bool = False,
     remove_commands: bool = False,
     remove_duplicates: bool = False,
     dry_run: bool = True,
@@ -208,12 +273,11 @@ async def prune(
     if interaction.user.id != OWNER_USER_ID:
         await interaction.response.send_message("Only the configured owner can prune messages.", ephemeral=True)
         return
-    if not any((contains_text, min_length, remove_links, remove_commands, remove_duplicates)):
+    if not any((contains_text, min_length, remove_commands, remove_duplicates)):
         await interaction.response.send_message("Choose at least one pruning rule.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-    link_pattern = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
     kept_messages: list[dict[str, str]] = []
     removed_ids: set[str] = set()
     seen_content: set[str] = set()
@@ -224,7 +288,6 @@ async def prune(
             (contains_text is not None and contains_text.casefold() in content.casefold())
             or
             len(content) < min_length
-            or (remove_links and link_pattern.search(content) is not None)
             or (remove_commands and content.lstrip().startswith(("!", "/")))
             or (remove_duplicates and content in seen_content)
         )
@@ -247,6 +310,87 @@ async def prune(
     )
 
 
+@bot.tree.command(name="delete_db", description="Delete all locally stored bot data")
+@discord.app_commands.describe(confirm="Must be true to permanently delete local data")
+async def delete_db(interaction: discord.Interaction, confirm: bool = False) -> None:
+    """Delete the local message store, prune records, and sync checkpoints."""
+    global stored_messages, pruned_ids, sync_state
+
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("Only the configured owner can delete stored data.", ephemeral=True)
+        return
+    if not confirm:
+        await interaction.response.send_message(
+            "This permanently deletes all locally stored messages and sync checkpoints. "
+            "Run `/delete_db confirm:true` to continue.",
+            ephemeral=True,
+        )
+        return
+    if active_sync_channels:
+        await interaction.response.send_message(
+            "Stop all active syncs before deleting stored data.",
+            ephemeral=True,
+        )
+        return
+
+    stored_messages = []
+    pruned_ids = set()
+    sync_state = {}
+    for data_file in (DATA_FILE, PRUNED_FILE, SYNC_STATE_FILE):
+        data_file.unlink(missing_ok=True)
+
+    await interaction.response.send_message(
+        "Deleted all locally stored messages, prune records, and sync checkpoints.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="set_filter", description="Temporarily limit which stored replies can be used")
+@discord.app_commands.describe(
+    min_length="Only use replies at least this many characters long",
+    contains_text="Only use replies containing this text or phrase",
+)
+async def set_filter(
+    interaction: discord.Interaction,
+    min_length: discord.app_commands.Range[int, 0, 2000] = 0,
+    contains_text: str | None = None,
+) -> None:
+    """Set an in-memory response filter without deleting stored messages."""
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("Only the configured owner can set response filters.", ephemeral=True)
+        return
+    if min_length == 0 and not contains_text:
+        await interaction.response.send_message(
+            "Choose a min_length or contains_text filter, or use `/clear_filter`.",
+            ephemeral=True,
+        )
+        return
+
+    response_filter["min_length"] = min_length
+    response_filter["contains_text"] = contains_text.casefold() if contains_text else ""
+    details = []
+    if min_length:
+        details.append(f"at least {min_length} characters")
+    if contains_text:
+        details.append(f"containing `{contains_text}`")
+    await interaction.response.send_message(
+        f"Temporary response filter set: {' and '.join(details)}. Stored data was not changed.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="clear_filter", description="Remove the temporary response filter")
+async def clear_filter(interaction: discord.Interaction) -> None:
+    """Restore the full stored message pool for replies."""
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("Only the configured owner can clear response filters.", ephemeral=True)
+        return
+
+    response_filter["min_length"] = 0
+    response_filter["contains_text"] = ""
+    await interaction.response.send_message("Temporary response filter cleared.", ephemeral=True)
+
+
 @bot.tree.command(name="stats", description="Show how many messages are stored")
 async def stats(interaction: discord.Interaction) -> None:
     """Show how many messages are available for replies."""
@@ -261,6 +405,8 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if KEYWORD in message.content.casefold() and stored_messages:
-        await message.channel.send(weighted_reply(message.content))
+        reply = weighted_reply(message.content)
+        if reply:
+            await message.channel.send(reply)
 
 bot.run(TOKEN)

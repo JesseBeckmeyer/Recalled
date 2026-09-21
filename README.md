@@ -29,11 +29,14 @@ It stores message content locally. Do not commit collected messages or your Disc
 
 ## Commands
 
-- `/sync` imports your messages from the channel where the command is run. Run it once per channel you want to include.
+- `/sync` imports your messages from the channel where the command is run. Use `since_date` to scan backward from now to a date, for example `/sync since_date:2025-01-01`. With no date, each run resumes from the last saved checkpoint for that channel.
+- `/stop_sync` stops an active sync in the current channel and saves its checkpoint so the next `/sync` resumes there.
 - `/stats` reports how many messages are stored.
-- `/prune` previews or removes messages using text, length, link, command, and duplicate filters. It is dry-run by default.
+- `/prune` previews or removes messages using text, length, command, and duplicate filters. It is dry-run by default.
+- `/delete_db confirm:true` permanently deletes all locally stored messages, prune records, and sync checkpoints. It does not delete Discord messages.
+- `/set_filter min_length:100` temporarily limits replies to stored messages at least 100 characters long. `contains_text` can require a word or phrase. Use `/clear_filter` to restore all stored replies; filters are memory-only and do not modify the database.
 
-Messages are stored locally in `messages.json`, with excluded IDs in `pruned_ids.json`; both are ignored by Git. The bot filters history by `OWNER_USER_ID` and does not save other members' messages.
+Messages are stored locally in `messages.json`, with excluded IDs in `pruned_ids.json` and per-channel sync checkpoints in `sync_state.json`; all are ignored by Git. The bot filters history by `OWNER_USER_ID` and does not save other members' messages.
 
 ## Docker
 

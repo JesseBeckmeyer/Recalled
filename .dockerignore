@@ -4,5 +4,6 @@ __pycache__/
 *.pyc
 messages.json
 pruned_ids.json
+sync_state.json
 .git/
 .vscode/

@@ -55,8 +55,19 @@ def save_pruned_ids(message_ids: set[str]) -> None:
         json.dump(sorted(message_ids), file, indent=2)
 
 
+NON_NOUN_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could",
+    "do", "for", "from", "has", "have", "he", "her", "here", "how", "i", "if",
+    "in", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our",
+    "she", "should", "so", "that", "the", "their", "them", "there", "they", "this",
+    "to", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will",
+    "with", "would", "you", "your",
+}
+
+
 def message_words(content: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9']+", content.casefold()))
+    words = set(re.findall(r"[a-z0-9']+", content.casefold()))
+    return {word for word in words if len(word) > 1 and word not in NON_NOUN_WORDS}
 
 
 def weighted_reply(query: str) -> str:

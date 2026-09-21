@@ -38,6 +38,10 @@ def connect_database() -> sqlite3.Connection:
             channel_id TEXT PRIMARY KEY,
             checkpoint TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sync_newest_state (
+            channel_id TEXT PRIMARY KEY,
+            checkpoint TEXT NOT NULL
+        );
         """
     )
     connection.commit()
@@ -59,9 +63,23 @@ def load_sync_state(connection: sqlite3.Connection) -> dict[str, str]:
     return {row["channel_id"]: row["checkpoint"] for row in rows}
 
 
+def load_newest_sync_state(connection: sqlite3.Connection) -> dict[str, str]:
+    rows = connection.execute("SELECT channel_id, checkpoint FROM sync_newest_state").fetchall()
+    return {row["channel_id"]: row["checkpoint"] for row in rows}
+
+
 def save_sync_checkpoint(connection: sqlite3.Connection, channel_id: str, checkpoint: str) -> None:
     connection.execute(
         "INSERT INTO sync_state(channel_id, checkpoint) VALUES (?, ?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET checkpoint = excluded.checkpoint",
+        (channel_id, checkpoint),
+    )
+    connection.commit()
+
+
+def save_newest_sync_checkpoint(connection: sqlite3.Connection, channel_id: str, checkpoint: str) -> None:
+    connection.execute(
+        "INSERT INTO sync_newest_state(channel_id, checkpoint) VALUES (?, ?) "
         "ON CONFLICT(channel_id) DO UPDATE SET checkpoint = excluded.checkpoint",
         (channel_id, checkpoint),
     )
@@ -110,6 +128,10 @@ def message_words(content: str) -> set[str]:
     return {word for word in words if len(word) > 1 and word not in NON_NOUN_WORDS}
 
 
+def contains_excluded_word(content: str) -> bool:
+    return "jesse" in re.findall(r"[a-z0-9']+", content.casefold())
+
+
 def weighted_reply(query: str) -> str:
     query_words = message_words(query)
     eligible_messages = [
@@ -137,6 +159,7 @@ database = connect_database()
 stored_messages = load_messages(database)
 pruned_ids = load_pruned_ids(database)
 sync_state = load_sync_state(database)
+newest_sync_state = load_newest_sync_state(database)
 active_sync_channels: set[int] = set()
 sync_stop_requests: set[int] = set()
 response_filter = {"min_length": 0, "contains_text": ""}
@@ -234,8 +257,16 @@ async def sync(
 
             scanned += 1
             sync_state[channel_state_key] = message.created_at.isoformat()
+            if scanned == 1:
+                newest_sync_state[channel_state_key] = str(message.id)
+                save_newest_sync_checkpoint(database, channel_state_key, str(message.id))
             message_id = str(message.id)
-            if message.author.id == OWNER_USER_ID and message.content and message_id not in known_ids:
+            if (
+                message.author.id == OWNER_USER_ID
+                and message.content
+                and not contains_excluded_word(message.content)
+                and message_id not in known_ids
+            ):
                 stored_messages.append({"id": message_id, "content": message.content})
                 insert_message(database, message_id, message.content)
                 known_ids.add(message_id)
@@ -261,6 +292,74 @@ async def sync(
         f"{'Stopped after' if stopped else 'Checked'} {scanned:,} message(s), imported {imported:,}, "
         f"and now have {len(stored_messages):,} stored messages."
         f"{resume_note}"
+    )
+
+
+@bot.tree.command(name="sync_new", description="Import newer messages since the last sync")
+@discord.app_commands.guild_only()
+async def sync_new(interaction: discord.Interaction) -> None:
+    """Import messages newer than this channel's newest sync checkpoint."""
+    global stored_messages
+
+    await interaction.response.defer()
+    if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.followup.send("This command must be run in a text channel.")
+        return
+
+    channel_id = interaction.channel.id
+    channel_state_key = str(channel_id)
+    if active_sync_channels:
+        await interaction.followup.send("A sync is already running. Stop it before starting another one.")
+        return
+
+    newest_id = newest_sync_state.get(channel_state_key)
+    after = discord.Object(id=int(newest_id)) if newest_id else None
+    known_ids = {message["id"] for message in stored_messages} | pruned_ids
+    imported = 0
+    scanned = 0
+    active_sync_channels.add(channel_id)
+    try:
+        async for message in interaction.channel.history(
+            limit=None,
+            after=after,
+            before=datetime.now(timezone.utc),
+            oldest_first=True,
+        ):
+            if channel_id in sync_stop_requests:
+                sync_stop_requests.remove(channel_id)
+                break
+            scanned += 1
+            newest_sync_state[channel_state_key] = str(message.id)
+            message_id = str(message.id)
+            if (
+                message.author.id == OWNER_USER_ID
+                and message.content
+                and not contains_excluded_word(message.content)
+                and message_id not in known_ids
+            ):
+                stored_messages.append({"id": message_id, "content": message.content})
+                insert_message(database, message_id, message.content)
+                known_ids.add(message_id)
+                imported += 1
+            if scanned % 500 == 0:
+                save_newest_sync_checkpoint(database, channel_state_key, newest_sync_state[channel_state_key])
+                await interaction.edit_original_response(
+                    content=f"Checking newer messages... {scanned:,} checked, {imported:,} imported."
+                )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I cannot read this channel's history. Grant me View Channel and Read Message History, then try again."
+        )
+        return
+    finally:
+        active_sync_channels.discard(channel_id)
+
+    if newest_sync_state.get(channel_state_key):
+        save_newest_sync_checkpoint(database, channel_state_key, newest_sync_state[channel_state_key])
+    database.commit()
+    await interaction.followup.send(
+        f"Checked {scanned:,} newer message(s), imported {imported:,}, and now have "
+        f"{len(stored_messages):,} stored messages."
     )
 
 
@@ -344,7 +443,7 @@ async def prune(
 @discord.app_commands.describe(confirm="Must be true to permanently delete local data")
 async def delete_db(interaction: discord.Interaction, confirm: bool = False) -> None:
     """Delete the local message store, prune records, and sync checkpoints."""
-    global stored_messages, pruned_ids, sync_state
+    global stored_messages, pruned_ids, sync_state, newest_sync_state
 
     if interaction.user.id != OWNER_USER_ID:
         await interaction.response.send_message("Only the configured owner can delete stored data.", ephemeral=True)
@@ -366,9 +465,11 @@ async def delete_db(interaction: discord.Interaction, confirm: bool = False) -> 
     stored_messages = []
     pruned_ids = set()
     sync_state = {}
+    newest_sync_state = {}
     database.execute("DELETE FROM messages")
     database.execute("DELETE FROM pruned_messages")
     database.execute("DELETE FROM sync_state")
+    database.execute("DELETE FROM sync_newest_state")
     database.commit()
 
     await interaction.response.send_message(

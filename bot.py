@@ -179,8 +179,8 @@ async def sync(
 
     channel_state_key = str(interaction.channel.id)
     channel_id = interaction.channel.id
-    if channel_id in active_sync_channels:
-        await interaction.followup.send("A sync is already running in this channel.")
+    if active_sync_channels:
+        await interaction.followup.send("A sync is already running. Stop it before starting another one.")
         return
 
     checkpoint = None if since_date else sync_state.get(channel_state_key)

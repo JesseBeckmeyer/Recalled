@@ -133,8 +133,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def setup_hook() -> None:
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
+        bot.tree.clear_commands(guild=guild)
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
     else:
         await bot.tree.sync()
 

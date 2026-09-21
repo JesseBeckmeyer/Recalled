@@ -1,0 +1,13 @@
+services:
+  discord-bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATA_FILE: /app/data/messages.json
+    volumes:
+      - messages-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  messages-data:

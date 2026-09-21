@@ -1,0 +1,8 @@
+.env
+messages.json
+pruned_ids.json
+__pycache__/
+.venv/
+.pytest_cache/
+.DS_Store
+.vscode/

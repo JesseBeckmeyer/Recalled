@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+messages.json
+pruned_ids.json
+.git/
+.vscode/

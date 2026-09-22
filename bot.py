@@ -55,15 +55,37 @@ def connect_database() -> sqlite3.Connection:
             channel_id TEXT PRIMARY KEY,
             checkpoint TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bot_replies (
+            bot_message_id TEXT PRIMARY KEY,
+            source_message_id TEXT NOT NULL,
+            guild_id TEXT,
+            channel_id TEXT NOT NULL,
+            sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
+    for column in ("guild_id", "channel_id"):
+        try:
+            connection.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass
     connection.commit()
     return connection
 
 
 def load_messages(connection: sqlite3.Connection) -> list[dict[str, str]]:
-    rows = connection.execute("SELECT id, content FROM messages ORDER BY rowid").fetchall()
-    return [{"id": row["id"], "content": row["content"]} for row in rows]
+    rows = connection.execute(
+        "SELECT id, content, guild_id, channel_id FROM messages ORDER BY rowid"
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "content": row["content"],
+            "guild_id": row["guild_id"],
+            "channel_id": row["channel_id"],
+        }
+        for row in rows
+    ]
 
 
 def load_pruned_ids(connection: sqlite3.Connection) -> set[str]:
@@ -99,11 +121,45 @@ def save_newest_sync_checkpoint(connection: sqlite3.Connection, channel_id: str,
     connection.commit()
 
 
-def insert_message(connection: sqlite3.Connection, message_id: str, content: str) -> None:
+def insert_message(
+    connection: sqlite3.Connection,
+    message_id: str,
+    content: str,
+    guild_id: str,
+    channel_id: str,
+) -> None:
     connection.execute(
-        "INSERT OR IGNORE INTO messages(id, content) VALUES (?, ?)",
-        (message_id, content),
+        "INSERT OR IGNORE INTO messages(id, content, guild_id, channel_id) VALUES (?, ?, ?, ?)",
+        (message_id, content, guild_id, channel_id),
     )
+
+
+def insert_bot_reply(
+    connection: sqlite3.Connection,
+    bot_message_id: str,
+    source_message_id: str,
+    guild_id: str | None,
+    channel_id: str,
+) -> None:
+    connection.execute(
+        "INSERT OR REPLACE INTO bot_replies "
+        "(bot_message_id, source_message_id, guild_id, channel_id) VALUES (?, ?, ?, ?)",
+        (bot_message_id, source_message_id, guild_id, channel_id),
+    )
+    connection.commit()
+
+
+def load_bot_reply(connection: sqlite3.Connection, bot_message_id: str | None = None) -> sqlite3.Row | None:
+    if bot_message_id:
+        return connection.execute(
+            "SELECT bot_message_id, source_message_id, guild_id, channel_id "
+            "FROM bot_replies WHERE bot_message_id = ?",
+            (bot_message_id,),
+        ).fetchone()
+    return connection.execute(
+        "SELECT bot_message_id, source_message_id, guild_id, channel_id "
+        "FROM bot_replies ORDER BY sent_at DESC, rowid DESC LIMIT 1"
+    ).fetchone()
 
 
 def delete_messages(connection: sqlite3.Connection, message_ids: set[str]) -> None:
@@ -145,7 +201,7 @@ def contains_excluded_word(content: str) -> bool:
     return "jesse" in re.findall(r"[a-z0-9']+", content.casefold())
 
 
-def weighted_reply(query: str) -> str:
+def weighted_message(query: str) -> dict[str, str] | None:
     query_words = message_words(query)
     eligible_messages = [
         message
@@ -157,7 +213,7 @@ def weighted_reply(query: str) -> str:
         )
     ]
     if not eligible_messages:
-        return ""
+        return None
 
     weights: list[int] = []
 
@@ -165,7 +221,7 @@ def weighted_reply(query: str) -> str:
         matching_words = query_words & message_words(message["content"])
         weights.append(1 + min(len(matching_words), 3))
 
-    return random.choices(eligible_messages, weights=weights, k=1)[0]["content"]
+    return random.choices(eligible_messages, weights=weights, k=1)[0]
 
 
 database = connect_database()
@@ -283,8 +339,21 @@ async def sync(
                 and not contains_excluded_word(message.content)
                 and message_id not in known_ids
             ):
-                stored_messages.append({"id": message_id, "content": message.content})
-                insert_message(database, message_id, message.content)
+                stored_messages.append(
+                    {
+                        "id": message_id,
+                        "content": message.content,
+                        "guild_id": str(message.guild.id) if message.guild else "",
+                        "channel_id": str(message.channel.id),
+                    }
+                )
+                insert_message(
+                    database,
+                    message_id,
+                    message.content,
+                    str(message.guild.id) if message.guild else "",
+                    str(message.channel.id),
+                )
                 known_ids.add(message_id)
                 imported += 1
             if scanned % 500 == 0:
@@ -365,8 +434,21 @@ async def sync_new(interaction: discord.Interaction) -> None:
                 and not contains_excluded_word(message.content)
                 and message_id not in known_ids
             ):
-                stored_messages.append({"id": message_id, "content": message.content})
-                insert_message(database, message_id, message.content)
+                stored_messages.append(
+                    {
+                        "id": message_id,
+                        "content": message.content,
+                        "guild_id": str(message.guild.id) if message.guild else "",
+                        "channel_id": str(message.channel.id),
+                    }
+                )
+                insert_message(
+                    database,
+                    message_id,
+                    message.content,
+                    str(message.guild.id) if message.guild else "",
+                    str(message.channel.id),
+                )
                 known_ids.add(message_id)
                 imported += 1
             if scanned % 500 == 0:
@@ -560,14 +642,45 @@ async def stats(interaction: discord.Interaction) -> None:
     )
 
 
+@bot.tree.command(name="locate", description="Find the original message for a bot reply")
+@discord.app_commands.describe(message_id="Optional ID of a message sent by the bot")
+async def locate(interaction: discord.Interaction, message_id: str | None = None) -> None:
+    """Link to the original stored message used for a bot reply."""
+    reply_record = load_bot_reply(database, message_id)
+    if reply_record is None:
+        target = f"message `{message_id}`" if message_id else "the most recent bot reply"
+        await interaction.response.send_message(f"I could not locate {target}.", ephemeral=True)
+        return
+
+    guild_id = reply_record["guild_id"]
+    if not guild_id:
+        await interaction.response.send_message(
+            "That reply does not have a guild channel link available.", ephemeral=True
+        )
+        return
+
+    original_link = (
+        f"https://discord.com/channels/{guild_id}/"
+        f"{reply_record['channel_id']}/{reply_record['source_message_id']}"
+    )
+    await interaction.response.send_message(f"Original message: {original_link}")
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author == bot.user:
         return
 
     if KEYWORD in message.content.casefold() and stored_messages:
-        reply = weighted_reply(message.content)
-        if reply:
-            await message.channel.send(reply)
+        source_message = weighted_message(message.content)
+        if source_message:
+            sent_message = await message.channel.send(source_message["content"])
+            insert_bot_reply(
+                database,
+                str(sent_message.id),
+                source_message["id"],
+                source_message.get("guild_id") or (str(message.guild.id) if message.guild else None),
+                source_message.get("channel_id") or str(message.channel.id),
+            )
 
 bot.run(TOKEN, log_handler=None)

@@ -32,6 +32,7 @@ It stores message content locally. Do not commit collected messages or your Disc
 - `/sync` imports your messages from the channel where the command is run. Use `since_date` to scan backward from now to a date, for example `/sync since_date:2025-01-01`. It scans up to 10,000 messages per run by default; use `max_messages` to change that. With no date, each run resumes from the last saved checkpoint for that channel.
 - `/sync_new` imports newer messages from the current channel since its last sync, without changing the backward-history checkpoint.
 - `/stop_sync` stops an active sync in the current channel and saves its checkpoint so the next `/sync` resumes there.
+- `/locate` links to the original message used for the most recent automatic bot reply. Pass `message_id` to locate a specific bot reply.
 - `/stats` reports how many messages are stored.
 - `/prune` previews or removes messages using text, length, command, and duplicate filters. It is dry-run by default.
 - `/delete_db confirm:true` permanently deletes all locally stored messages, prune records, and sync checkpoints. It does not delete Discord messages.

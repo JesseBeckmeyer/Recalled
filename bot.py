@@ -259,9 +259,10 @@ async def on_ready() -> None:
 
 @tasks.loop(minutes=2)
 async def rotate_status() -> None:
-    if not stored_messages:
+    status_messages = [message for message in stored_messages if len(message["content"]) > 40]
+    if not status_messages:
         return
-    status_text = random.choice(stored_messages)["content"].replace("\n", " ").strip()
+    status_text = random.choice(status_messages)["content"].replace("\n", " ").strip()
     await bot.change_presence(activity=discord.Game(name=status_text[:128]))
 
 

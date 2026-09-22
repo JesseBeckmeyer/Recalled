@@ -600,9 +600,6 @@ async def set_filter(
     contains_text: str | None = None,
 ) -> None:
     """Set an in-memory response filter without deleting stored messages."""
-    if interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("Only the configured owner can set response filters.", ephemeral=True)
-        return
     if min_length == 0 and not contains_text:
         await interaction.response.send_message(
             "Choose a min_length or contains_text filter, or use `/clear_filter`.",
@@ -626,10 +623,6 @@ async def set_filter(
 @bot.tree.command(name="clear_filter", description="Remove the temporary response filter")
 async def clear_filter(interaction: discord.Interaction) -> None:
     """Restore the full stored message pool for replies."""
-    if interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("Only the configured owner can clear response filters.", ephemeral=True)
-        return
-
     response_filter["min_length"] = 0
     response_filter["contains_text"] = ""
     await interaction.response.send_message("Temporary response filter cleared.", ephemeral=True)
@@ -668,20 +661,52 @@ async def locate(interaction: discord.Interaction, message_id: str | None = None
 
 
 @bot.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.application_command:
+        return
+
+    command_name = interaction.data.get("name", "unknown") if interaction.data else "unknown"
+    command_options = interaction.data.get("options", []) if interaction.data else []
+    logger.info(
+        "Command received: /%s from user %s in channel %s with options %s.",
+        command_name,
+        interaction.user.id,
+        interaction.channel.id if interaction.channel else "unknown",
+        command_options,
+    )
+
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author == bot.user:
         return
 
-    if KEYWORD in message.content.casefold() and stored_messages:
-        source_message = weighted_message(message.content)
-        if source_message:
-            sent_message = await message.channel.send(source_message["content"])
-            insert_bot_reply(
-                database,
-                str(sent_message.id),
-                source_message["id"],
-                source_message.get("guild_id") or (str(message.guild.id) if message.guild else None),
-                source_message.get("channel_id") or str(message.channel.id),
-            )
+    logger.info(
+        "Message received from user %s in channel %s.",
+        message.author.id,
+        message.channel.id,
+    )
+    if KEYWORD not in message.content.casefold():
+        return
+
+    logger.info("Keyword matched in channel %s.", message.channel.id)
+    if not stored_messages:
+        logger.info("No stored messages available for a reply.")
+        return
+
+    source_message = weighted_message(message.content)
+    if not source_message:
+        logger.info("No stored messages passed the active response filter.")
+        return
+
+    sent_message = await message.channel.send(source_message["content"])
+    insert_bot_reply(
+        database,
+        str(sent_message.id),
+        source_message["id"],
+        source_message.get("guild_id") or (str(message.guild.id) if message.guild else None),
+        source_message.get("channel_id") or str(message.channel.id),
+    )
+    logger.info("Reply sent as message %s in channel %s.", sent_message.id, message.channel.id)
 
 bot.run(TOKEN, log_handler=None)

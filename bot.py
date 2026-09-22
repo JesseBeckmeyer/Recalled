@@ -200,10 +200,12 @@ async def rotate_status() -> None:
 @discord.app_commands.guild_only()
 @discord.app_commands.describe(
     since_date="Scan backward from now to this date, YYYY-MM-DD",
+    max_messages="Maximum messages to scan in this run; the next run resumes here",
 )
 async def sync(
     interaction: discord.Interaction,
     since_date: str | None = None,
+    max_messages: discord.app_commands.Range[int, 100, 50000] = 40000,
 ) -> None:
     """Import the owner's messages from the channel where this command is used."""
     global stored_messages
@@ -243,6 +245,7 @@ async def sync(
 
     active_sync_channels.add(channel_id)
     stopped = False
+    reached_limit = False
     try:
         async for message in interaction.channel.history(
             limit=None,
@@ -274,9 +277,15 @@ async def sync(
             if scanned % 500 == 0:
                 save_sync_checkpoint(database, channel_state_key, sync_state[channel_state_key])
                 database.commit()
-                await interaction.edit_original_response(
-                    content=f"Still scanning history... {scanned:,} messages checked, {imported:,} imported."
-                )
+                try:
+                    await interaction.edit_original_response(
+                        content=f"Still scanning history... {scanned:,} messages checked, {imported:,} imported."
+                    )
+                except discord.HTTPException:
+                    pass
+            if scanned >= max_messages:
+                reached_limit = True
+                break
     except discord.Forbidden:
         await interaction.followup.send(
             "I cannot read this channel's history. Grant me View Channel and Read Message History, then try again."
@@ -287,12 +296,15 @@ async def sync(
 
     save_sync_checkpoint(database, channel_state_key, sync_state.get(channel_state_key, ""))
     database.commit()
-    resume_note = " This channel will resume from this point next time." if stopped or not since_date else ""
-    await interaction.followup.send(
-        f"{'Stopped after' if stopped else 'Checked'} {scanned:,} message(s), imported {imported:,}, "
-        f"and now have {len(stored_messages):,} stored messages."
-        f"{resume_note}"
-    )
+    resume_note = " This channel will resume from this point next time." if stopped or reached_limit or not since_date else ""
+    try:
+        await interaction.followup.send(
+            f"{'Stopped after' if stopped else 'Checked'} {scanned:,} message(s), imported {imported:,}, "
+            f"and now have {len(stored_messages):,} stored messages."
+            f"{resume_note}"
+        )
+    except discord.HTTPException:
+        print(f"Sync completed after {scanned:,} messages; the interaction expired before the final response.")
 
 
 @bot.tree.command(name="sync_new", description="Import newer messages since the last sync")

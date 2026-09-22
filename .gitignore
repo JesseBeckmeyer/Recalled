@@ -4,6 +4,7 @@ pruned_ids.json
 sync_state.json
 recalled.db
 recalled.db-*
+recalled.log
 __pycache__/
 .venv/
 .pytest_cache/

@@ -1,4 +1,5 @@
 import os
+import logging
 import random
 import re
 import sqlite3
@@ -16,7 +17,19 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
 KEYWORD = os.getenv("KEYWORD", "").strip().casefold()
 DATABASE_FILE = Path(os.getenv("DATABASE_FILE", "recalled.db"))
+LOG_FILE = Path(os.getenv("LOG_FILE", "recalled.log"))
 GUILD_ID = os.getenv("GUILD_ID")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+    force=True,
+)
+logger = logging.getLogger("recalled")
 
 if not KEYWORD:
     raise RuntimeError("KEYWORD must be set in .env")
@@ -185,7 +198,7 @@ async def setup_hook() -> None:
 async def on_ready() -> None:
     if not rotate_status.is_running():
         rotate_status.start()
-    print(f"Logged in as {bot.user} with {len(stored_messages)} stored messages.")
+    logger.info("Logged in as %s with %s stored messages.", bot.user, len(stored_messages))
 
 
 @tasks.loop(minutes=2)
@@ -304,7 +317,10 @@ async def sync(
             f"{resume_note}"
         )
     except discord.HTTPException:
-        print(f"Sync completed after {scanned:,} messages; the interaction expired before the final response.")
+        logger.info(
+            "Sync completed after %s messages; the interaction expired before the final response.",
+            f"{scanned:,}",
+        )
 
 
 @bot.tree.command(name="sync_new", description="Import newer messages since the last sync")
@@ -554,4 +570,4 @@ async def on_message(message: discord.Message) -> None:
         if reply:
             await message.channel.send(reply)
 
-bot.run(TOKEN)
+bot.run(TOKEN, log_handler=None)

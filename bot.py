@@ -342,7 +342,7 @@ async def rotate_status() -> None:
     status_messages = [
         message
         for message in stored_messages
-        if len(message["content"]) > 26
+        if len(message["content"]) < 26
         and not re.search(r"https?://\S+|www\.\S+", message["content"], re.IGNORECASE)
     ]
     if not status_messages:

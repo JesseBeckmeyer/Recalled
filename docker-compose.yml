@@ -6,7 +6,7 @@ services:
     environment:
       DATABASE_FILE: /app/data/recalled.db
     volumes:
-      - messages-data:/app/data
+      - ./data:/app/data
     restart: unless-stopped
 
 volumes:

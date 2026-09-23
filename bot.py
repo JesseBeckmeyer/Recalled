@@ -339,7 +339,12 @@ async def on_ready() -> None:
 
 @tasks.loop(minutes=2)
 async def rotate_status() -> None:
-    status_messages = [message for message in stored_messages if len(message["content"]) > 40]
+    status_messages = [
+        message
+        for message in stored_messages
+        if len(message["content"]) > 26
+        and not re.search(r"https?://\S+|www\.\S+", message["content"], re.IGNORECASE)
+    ]
     if not status_messages:
         logger.info("Status rotation skipped: no stored message is longer than 40 characters.")
         return

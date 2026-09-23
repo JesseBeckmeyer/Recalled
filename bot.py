@@ -1,10 +1,13 @@
 import os
+import json
 import logging
 import random
 import re
 import sqlite3
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
+from typing import TypedDict
 
 import discord
 from discord.ext import commands, tasks
@@ -31,6 +34,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("recalled")
 
+
+class StoredMessage(TypedDict):
+    id: str
+    content: str
+    guild_id: str | None
+    channel_id: str | None
+    attachment_urls: list[str]
+
 if not KEYWORD:
     raise RuntimeError("KEYWORD must be set in .env")
 
@@ -42,7 +53,8 @@ def connect_database() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
-            content TEXT NOT NULL
+            content TEXT NOT NULL,
+            attachment_urls TEXT NOT NULL DEFAULT '[]'
         );
         CREATE TABLE IF NOT EXISTS pruned_messages (
             id TEXT PRIMARY KEY
@@ -64,18 +76,19 @@ def connect_database() -> sqlite3.Connection:
         );
         """
     )
-    for column in ("guild_id", "channel_id"):
+    for column in ("guild_id", "channel_id", "attachment_urls"):
         try:
             connection.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    connection.execute("UPDATE messages SET attachment_urls = '[]' WHERE attachment_urls IS NULL")
     connection.commit()
     return connection
 
 
-def load_messages(connection: sqlite3.Connection) -> list[dict[str, str]]:
+def load_messages(connection: sqlite3.Connection) -> list[StoredMessage]:
     rows = connection.execute(
-        "SELECT id, content, guild_id, channel_id FROM messages ORDER BY rowid"
+        "SELECT id, content, guild_id, channel_id, attachment_urls FROM messages ORDER BY rowid"
     ).fetchall()
     return [
         {
@@ -83,6 +96,7 @@ def load_messages(connection: sqlite3.Connection) -> list[dict[str, str]]:
             "content": row["content"],
             "guild_id": row["guild_id"],
             "channel_id": row["channel_id"],
+            "attachment_urls": json.loads(row["attachment_urls"] or "[]"),
         }
         for row in rows
     ]
@@ -127,10 +141,12 @@ def insert_message(
     content: str,
     guild_id: str,
     channel_id: str,
+    attachment_urls: list[str],
 ) -> None:
     connection.execute(
-        "INSERT OR IGNORE INTO messages(id, content, guild_id, channel_id) VALUES (?, ?, ?, ?)",
-        (message_id, content, guild_id, channel_id),
+        "INSERT OR IGNORE INTO messages "
+        "(id, content, guild_id, channel_id, attachment_urls) VALUES (?, ?, ?, ?, ?)",
+        (message_id, content, guild_id, channel_id, json.dumps(attachment_urls)),
     )
 
 
@@ -201,7 +217,28 @@ def contains_excluded_word(content: str) -> bool:
     return "jesse" in re.findall(r"[a-z0-9']+", content.casefold())
 
 
-def weighted_message(query: str) -> dict[str, str] | None:
+def image_attachment_urls(message: discord.Message) -> list[str]:
+    return [
+        attachment.url
+        for attachment in message.attachments
+        if attachment.content_type and attachment.content_type.startswith("image/")
+    ]
+
+
+def fuzzy_word_score(query_words: set[str], candidate_words: set[str]) -> float:
+    if not query_words or not candidate_words:
+        return 0.0
+
+    best_matches = []
+    for query_word in query_words:
+        best_matches.append(
+            max(SequenceMatcher(None, query_word, candidate_word).ratio() for candidate_word in candidate_words)
+        )
+    useful_matches = [score for score in best_matches if score >= 0.75]
+    return sum(useful_matches) / len(useful_matches) if useful_matches else 0.0
+
+
+def weighted_message(query: str) -> StoredMessage | None:
     query_words = message_words(query)
     eligible_messages = [
         message
@@ -218,8 +255,12 @@ def weighted_message(query: str) -> dict[str, str] | None:
     weights: list[int] = []
 
     for message in eligible_messages:
-        matching_words = query_words & message_words(message["content"])
-        weights.append(1 + min(len(matching_words), 3))
+        candidate_words = message_words(message["content"])
+        matching_words = query_words & candidate_words
+        fuzzy_score = fuzzy_word_score(query_words, candidate_words)
+        exact_weight = min(len(matching_words), 3) * 3
+        fuzzy_weight = round(fuzzy_score * 4)
+        weights.append(1 + exact_weight + fuzzy_weight)
 
     return random.choices(eligible_messages, weights=weights, k=1)[0]
 
@@ -240,30 +281,40 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def setup_hook() -> None:
     if GUILD_ID:
+        logger.info("Registering slash commands for guild %s.", GUILD_ID)
         guild = discord.Object(id=int(GUILD_ID))
         bot.tree.clear_commands(guild=guild)
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
+        logger.info("Slash commands registered for guild %s.", GUILD_ID)
     else:
         await bot.tree.sync()
+        logger.info("Slash commands registered globally.")
 
 
 @bot.event
 async def on_ready() -> None:
     if not rotate_status.is_running():
         rotate_status.start()
-    logger.info("Logged in as %s with %s stored messages.", bot.user, len(stored_messages))
+    logger.info(
+        "Logged in as %s with %s stored messages and %s active sync(s).",
+        bot.user,
+        len(stored_messages),
+        len(active_sync_channels),
+    )
 
 
 @tasks.loop(minutes=2)
 async def rotate_status() -> None:
     status_messages = [message for message in stored_messages if len(message["content"]) > 40]
     if not status_messages:
+        logger.info("Status rotation skipped: no stored message is longer than 40 characters.")
         return
     status_text = random.choice(status_messages)["content"].replace("\n", " ").strip()
     await bot.change_presence(activity=discord.Game(name=status_text[:128]))
+    logger.info("Status rotated using one of %s qualifying stored messages.", len(status_messages))
 
 
 @bot.tree.command(name="sync", description="Import your messages from this channel")
@@ -300,7 +351,13 @@ async def sync(
 
     channel_state_key = str(interaction.channel.id)
     channel_id = interaction.channel.id
-    if active_sync_channels:
+    logger.info(
+        "Starting backward sync in channel %s: since_date=%s, max_messages=%s.",
+        channel_id,
+        since_date or "none",
+        max_messages,
+    )
+    if channel_id in active_sync_channels:
         await interaction.followup.send("A sync is already running. Stop it before starting another one.")
         return
 
@@ -312,6 +369,11 @@ async def sync(
             checkpoint_time = None
     else:
         checkpoint_time = None
+    start_note = (
+        " Resumed from the saved checkpoint."
+        if checkpoint_time is not None
+        else " Started a new history scan."
+    )
 
     active_sync_channels.add(channel_id)
     stopped = False
@@ -334,9 +396,10 @@ async def sync(
                 newest_sync_state[channel_state_key] = str(message.id)
                 save_newest_sync_checkpoint(database, channel_state_key, str(message.id))
             message_id = str(message.id)
+            attachment_urls = image_attachment_urls(message)
             if (
                 message.author.id == OWNER_USER_ID
-                and message.content
+                and (message.content or attachment_urls)
                 and not contains_excluded_word(message.content)
                 and message_id not in known_ids
             ):
@@ -346,6 +409,7 @@ async def sync(
                         "content": message.content,
                         "guild_id": str(message.guild.id) if message.guild else "",
                         "channel_id": str(message.channel.id),
+                        "attachment_urls": attachment_urls,
                     }
                 )
                 insert_message(
@@ -354,12 +418,19 @@ async def sync(
                     message.content,
                     str(message.guild.id) if message.guild else "",
                     str(message.channel.id),
+                    attachment_urls,
                 )
                 known_ids.add(message_id)
                 imported += 1
             if scanned % 500 == 0:
                 save_sync_checkpoint(database, channel_state_key, sync_state[channel_state_key])
                 database.commit()
+                logger.info(
+                    "Backward sync in channel %s: scanned=%s, imported=%s.",
+                    channel_id,
+                    scanned,
+                    imported,
+                )
                 try:
                     await interaction.edit_original_response(
                         content=f"Still scanning history... {scanned:,} messages checked, {imported:,} imported."
@@ -379,11 +450,19 @@ async def sync(
 
     save_sync_checkpoint(database, channel_state_key, sync_state.get(channel_state_key, ""))
     database.commit()
+    logger.info(
+        "Backward sync finished in channel %s: scanned=%s, imported=%s, stopped=%s.",
+        channel_id,
+        scanned,
+        imported,
+        stopped,
+    )
     resume_note = " This channel will resume from this point next time." if stopped or reached_limit or not since_date else ""
     try:
         await interaction.followup.send(
             f"{'Stopped after' if stopped else 'Checked'} {scanned:,} message(s), imported {imported:,}, "
             f"and now have {len(stored_messages):,} stored messages."
+            f"{start_note}"
             f"{resume_note}"
         )
     except discord.HTTPException:
@@ -406,7 +485,8 @@ async def sync_new(interaction: discord.Interaction) -> None:
 
     channel_id = interaction.channel.id
     channel_state_key = str(channel_id)
-    if active_sync_channels:
+    logger.info("Starting newer-message sync in channel %s.", channel_id)
+    if channel_id in active_sync_channels:
         await interaction.followup.send("A sync is already running. Stop it before starting another one.")
         return
 
@@ -429,9 +509,10 @@ async def sync_new(interaction: discord.Interaction) -> None:
             scanned += 1
             newest_sync_state[channel_state_key] = str(message.id)
             message_id = str(message.id)
+            attachment_urls = image_attachment_urls(message)
             if (
                 message.author.id == OWNER_USER_ID
-                and message.content
+                and (message.content or attachment_urls)
                 and not contains_excluded_word(message.content)
                 and message_id not in known_ids
             ):
@@ -441,6 +522,7 @@ async def sync_new(interaction: discord.Interaction) -> None:
                         "content": message.content,
                         "guild_id": str(message.guild.id) if message.guild else "",
                         "channel_id": str(message.channel.id),
+                        "attachment_urls": attachment_urls,
                     }
                 )
                 insert_message(
@@ -449,11 +531,18 @@ async def sync_new(interaction: discord.Interaction) -> None:
                     message.content,
                     str(message.guild.id) if message.guild else "",
                     str(message.channel.id),
+                    attachment_urls,
                 )
                 known_ids.add(message_id)
                 imported += 1
             if scanned % 500 == 0:
                 save_newest_sync_checkpoint(database, channel_state_key, newest_sync_state[channel_state_key])
+                logger.info(
+                    "Newer-message sync in channel %s: scanned=%s, imported=%s.",
+                    channel_id,
+                    scanned,
+                    imported,
+                )
                 await interaction.edit_original_response(
                     content=f"Checking newer messages... {scanned:,} checked, {imported:,} imported."
                 )
@@ -468,6 +557,12 @@ async def sync_new(interaction: discord.Interaction) -> None:
     if newest_sync_state.get(channel_state_key):
         save_newest_sync_checkpoint(database, channel_state_key, newest_sync_state[channel_state_key])
     database.commit()
+    logger.info(
+        "Newer-message sync finished in channel %s: scanned=%s, imported=%s.",
+        channel_id,
+        scanned,
+        imported,
+    )
     await interaction.followup.send(
         f"Checked {scanned:,} newer message(s), imported {imported:,}, and now have "
         f"{len(stored_messages):,} stored messages."
@@ -519,7 +614,7 @@ async def prune(
         return
 
     await interaction.response.defer(ephemeral=True)
-    kept_messages: list[dict[str, str]] = []
+    kept_messages: list[StoredMessage] = []
     removed_ids: set[str] = set()
     seen_content: set[str] = set()
 
@@ -631,8 +726,36 @@ async def clear_filter(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="stats", description="Show how many messages are stored")
 async def stats(interaction: discord.Interaction) -> None:
     """Show how many messages are available for replies."""
+    eligible_messages = [
+        message
+        for message in stored_messages
+        if len(message["content"]) >= response_filter["min_length"]
+        and (
+            not response_filter["contains_text"]
+            or response_filter["contains_text"] in message["content"].casefold()
+        )
+    ]
+    total_characters = sum(len(message["content"]) for message in stored_messages)
+    bot_reply_count = database.execute("SELECT COUNT(*) FROM bot_replies").fetchone()[0]
+    oldest_date = "unknown"
+    newest_date = "unknown"
+    if stored_messages:
+        try:
+            oldest_id = min(int(message["id"]) for message in stored_messages)
+            newest_id = max(int(message["id"]) for message in stored_messages)
+            oldest_date = discord.utils.snowflake_time(oldest_id).strftime("%Y-%m-%d")
+            newest_date = discord.utils.snowflake_time(newest_id).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError):
+            pass
+
     await interaction.response.send_message(
-        f"I have {len(stored_messages)} stored message(s) for keyword `{KEYWORD}`."
+        f"Keyword: `{KEYWORD}`\n"
+        f"Stored messages: {len(stored_messages):,}\n"
+        f"Eligible with current filter: {len(eligible_messages):,}\n"
+        f"Total stored characters: {total_characters:,}\n"
+        f"Recorded bot replies: {bot_reply_count:,}\n"
+        f"Message date range: {oldest_date} to {newest_date}\n"
+        f"Matching: exact and fuzzy word overlap"
     )
 
 
@@ -699,7 +822,8 @@ async def on_message(message: discord.Message) -> None:
         logger.info("No stored messages passed the active response filter.")
         return
 
-    sent_message = await message.channel.send(source_message["content"])
+    reply_parts = [source_message["content"], *source_message.get("attachment_urls", [])]
+    sent_message = await message.channel.send("\n".join(part for part in reply_parts if part))
     insert_bot_reply(
         database,
         str(sent_message.id),

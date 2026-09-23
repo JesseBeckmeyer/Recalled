@@ -4,6 +4,7 @@ import logging
 import random
 import re
 import sqlite3
+import shutil
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -20,6 +21,7 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
 KEYWORD = os.getenv("KEYWORD", "").strip().casefold()
 DATABASE_FILE = Path(os.getenv("DATABASE_FILE", "recalled.db"))
+SEED_DATABASE_FILE = Path(os.getenv("SEED_DATABASE_FILE", "/app/seed/recalled.db"))
 LOG_FILE = Path(os.getenv("LOG_FILE", "recalled.log"))
 GUILD_ID = os.getenv("GUILD_ID")
 
@@ -44,6 +46,25 @@ class StoredMessage(TypedDict):
 
 if not KEYWORD:
     raise RuntimeError("KEYWORD must be set in .env")
+
+
+def seed_database_if_needed() -> None:
+    if not SEED_DATABASE_FILE.exists() or SEED_DATABASE_FILE == DATABASE_FILE:
+        return
+
+    should_seed = not DATABASE_FILE.exists()
+    if DATABASE_FILE.exists():
+        try:
+            with sqlite3.connect(DATABASE_FILE) as connection:
+                stored_count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            should_seed = stored_count == 0
+        except sqlite3.DatabaseError:
+            should_seed = True
+
+    if should_seed:
+        DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SEED_DATABASE_FILE, DATABASE_FILE)
+        logger.info("Seeded database from %s.", SEED_DATABASE_FILE)
 
 
 def connect_database() -> sqlite3.Connection:
@@ -274,6 +295,7 @@ def weighted_message(query: str) -> StoredMessage | None:
     return random.choices(eligible_messages, weights=weights, k=1)[0]
 
 
+seed_database_if_needed()
 database = connect_database()
 stored_messages = load_messages(database)
 pruned_ids = load_pruned_ids(database)

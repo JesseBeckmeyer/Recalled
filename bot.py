@@ -187,6 +187,15 @@ def delete_messages(connection: sqlite3.Connection, message_ids: set[str]) -> No
     connection.commit()
 
 
+async def update_sync_progress(interaction: discord.Interaction, content: str) -> bool:
+    try:
+        await interaction.edit_original_response(content=content)
+    except discord.HTTPException as error:
+        logger.info("Could not update sync progress because the interaction expired: %s", error)
+        return False
+    return True
+
+
 NON_NOUN_WORDS = {
     "jesse", "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any",
     "are", "aren't", "as", "at", "be", "because", "been", "before", "being", "below",
@@ -431,12 +440,10 @@ async def sync(
                     scanned,
                     imported,
                 )
-                try:
-                    await interaction.edit_original_response(
-                        content=f"Still scanning history... {scanned:,} messages checked, {imported:,} imported."
-                    )
-                except discord.HTTPException:
-                    pass
+                await update_sync_progress(
+                    interaction,
+                    f"Still scanning history... {scanned:,} messages checked, {imported:,} imported.",
+                )
             if scanned >= max_messages:
                 reached_limit = True
                 break
@@ -543,8 +550,9 @@ async def sync_new(interaction: discord.Interaction) -> None:
                     scanned,
                     imported,
                 )
-                await interaction.edit_original_response(
-                    content=f"Checking newer messages... {scanned:,} checked, {imported:,} imported."
+                await update_sync_progress(
+                    interaction,
+                    f"Checking newer messages... {scanned:,} checked, {imported:,} imported.",
                 )
     except discord.Forbidden:
         await interaction.followup.send(

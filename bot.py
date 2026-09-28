@@ -305,6 +305,9 @@ newest_sync_state = load_newest_sync_state(database)
 active_sync_channels: set[int] = set()
 sync_stop_requests: set[int] = set()
 response_filter = {"min_length": 0, "contains_text": ""}
+FOLLOW_UP_TIMEOUT_SECONDS = float(os.getenv("FOLLOW_UP_TIMEOUT_SECONDS", "10.0"))
+follow_up_timeout_seconds = FOLLOW_UP_TIMEOUT_SECONDS
+last_bot_reply_at: dict[int, float] = {}
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -784,10 +787,12 @@ async def stats(interaction: discord.Interaction) -> None:
         except (TypeError, ValueError, OverflowError):
             pass
 
+    timer_status = f"{follow_up_timeout_seconds:g}s" if follow_up_timeout_seconds > 0 else "disabled"
     await interaction.response.send_message(
         f"Keyword: `{KEYWORD}`\n"
         f"Stored messages: {len(stored_messages):,}\n"
         f"Eligible with current filter: {len(eligible_messages):,}\n"
+        f"Follow-up auto-response timer: {timer_status}\n"
         f"Total stored characters: {total_characters:,}\n"
         f"Recorded bot replies: {bot_reply_count:,}\n"
         f"Message date range: {oldest_date} to {newest_date}\n"
@@ -819,6 +824,54 @@ async def locate(interaction: discord.Interaction, message_id: str | None = None
     await interaction.response.send_message(f"Original message: {original_link}")
 
 
+@bot.tree.command(name="set_timer", description="Set or view the follow-up auto-response timer in seconds")
+@discord.app_commands.describe(seconds="Auto-response window in seconds (e.g. 10, or 0 to disable, leave empty to view)")
+async def set_timer(
+    interaction: discord.Interaction,
+    seconds: discord.app_commands.Range[float, 0.0, 300.0] | None = None,
+) -> None:
+    """Set or view the follow-up auto-response window in seconds."""
+    global follow_up_timeout_seconds
+    if seconds is None:
+        status = f"**{follow_up_timeout_seconds:g} seconds**" if follow_up_timeout_seconds > 0 else "**disabled**"
+        await interaction.response.send_message(
+            f"The follow-up auto-response timer is currently {status}.",
+            ephemeral=True,
+        )
+        return
+
+    follow_up_timeout_seconds = float(seconds)
+    if follow_up_timeout_seconds > 0:
+        await interaction.response.send_message(
+            f"Follow-up auto-response timer set to **{follow_up_timeout_seconds:g} seconds**.",
+            ephemeral=True,
+        )
+        logger.info(
+            "Follow-up auto-response timer set to %s seconds by user %s.",
+            follow_up_timeout_seconds,
+            interaction.user.id,
+        )
+    else:
+        await interaction.response.send_message(
+            "Follow-up auto-response timer has been **disabled**.",
+            ephemeral=True,
+        )
+        logger.info(
+            "Follow-up auto-response timer disabled by user %s.",
+            interaction.user.id,
+        )
+
+
+@bot.tree.command(name="timer", description="View or set the follow-up auto-response timer in seconds")
+@discord.app_commands.describe(seconds="Auto-response window in seconds (e.g. 10, or 0 to disable, leave empty to view)")
+async def timer(
+    interaction: discord.Interaction,
+    seconds: discord.app_commands.Range[float, 0.0, 300.0] | None = None,
+) -> None:
+    """Alias for /set_timer."""
+    await set_timer(interaction, seconds)
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction) -> None:
     if interaction.type != discord.InteractionType.application_command:
@@ -835,10 +888,6 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     )
 
 
-FOLLOW_UP_TIMEOUT_SECONDS = 10.0
-last_bot_reply_at: dict[int, float] = {}
-
-
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.author == bot.user:
@@ -853,9 +902,13 @@ async def on_message(message: discord.Message) -> None:
     has_keyword = KEYWORD in message.content.casefold()
     now = time.monotonic()
     last_reply_time = last_bot_reply_at.get(message.channel.id)
-    is_follow_up = last_reply_time is not None and (now - last_reply_time) <= FOLLOW_UP_TIMEOUT_SECONDS
+    is_follow_up = (
+        follow_up_timeout_seconds > 0
+        and last_reply_time is not None
+        and (now - last_reply_time) <= follow_up_timeout_seconds
+    )
 
-    # Respond if keyword is present OR if sent within 10 seconds of previous bot response
+    # Respond if keyword is present OR if sent within the follow-up window
     if not has_keyword and not is_follow_up:
         return
 
@@ -869,7 +922,7 @@ async def on_message(message: discord.Message) -> None:
     else:
         logger.info(
             "Auto-replying to follow-up message within %.1fs window in channel %s.",
-            FOLLOW_UP_TIMEOUT_SECONDS,
+            follow_up_timeout_seconds,
             message.channel.id,
         )
 

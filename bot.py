@@ -5,6 +5,7 @@ import random
 import re
 import sqlite3
 import shutil
+import time
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -834,9 +835,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     )
 
 
+FOLLOW_UP_TIMEOUT_SECONDS = 10.0
+last_bot_reply_at: dict[int, float] = {}
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author == bot.user:
+    if message.author.bot or message.author == bot.user:
         return
 
     logger.info(
@@ -844,10 +849,30 @@ async def on_message(message: discord.Message) -> None:
         message.author.id,
         message.channel.id,
     )
-    if KEYWORD not in message.content.casefold():
+
+    has_keyword = KEYWORD in message.content.casefold()
+    now = time.monotonic()
+    last_reply_time = last_bot_reply_at.get(message.channel.id)
+    is_follow_up = last_reply_time is not None and (now - last_reply_time) <= FOLLOW_UP_TIMEOUT_SECONDS
+
+    # Respond if keyword is present OR if sent within 10 seconds of previous bot response
+    if not has_keyword and not is_follow_up:
         return
 
-    logger.info("Keyword matched in channel %s.", message.channel.id)
+    if has_keyword and is_follow_up:
+        logger.info(
+            "Keyword matched in channel %s within follow-up window (single response).",
+            message.channel.id,
+        )
+    elif has_keyword:
+        logger.info("Keyword matched in channel %s.", message.channel.id)
+    else:
+        logger.info(
+            "Auto-replying to follow-up message within %.1fs window in channel %s.",
+            FOLLOW_UP_TIMEOUT_SECONDS,
+            message.channel.id,
+        )
+
     if not stored_messages:
         logger.info("No stored messages available for a reply.")
         return
@@ -859,6 +884,8 @@ async def on_message(message: discord.Message) -> None:
 
     reply_parts = [source_message["content"], *source_message.get("attachment_urls", [])]
     sent_message = await message.channel.send("\n".join(part for part in reply_parts if part))
+    last_bot_reply_at[message.channel.id] = time.monotonic()
+
     insert_bot_reply(
         database,
         str(sent_message.id),
@@ -867,5 +894,6 @@ async def on_message(message: discord.Message) -> None:
         source_message.get("channel_id") or str(message.channel.id),
     )
     logger.info("Reply sent as message %s in channel %s.", sent_message.id, message.channel.id)
+
 
 bot.run(TOKEN, log_handler=None)

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import logging
@@ -5,6 +6,7 @@ import random
 import re
 import sqlite3
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -13,6 +15,84 @@ from typing import TypedDict
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
+import array
+import time
+from collections import defaultdict
+from collections.abc import Callable
+
+try:
+    import audioop
+    AUDIOOP_AVAILABLE = True
+except ImportError:
+    AUDIOOP_AVAILABLE = False
+
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
+
+try:
+    import davey
+    DAVEY_AVAILABLE = True
+except ImportError:
+    DAVEY_AVAILABLE = False
+
+try:
+    from discord.ext import voice_recv
+    from discord.ext.voice_recv import opus as voice_recv_opus
+
+    _orig_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
+    _decode_error_count = 0
+
+    def _safe_decode_packet(self, packet):
+        global _decode_error_count
+        try:
+            if packet and packet.decrypted_data:
+                raw_data = packet.decrypted_data
+                if DAVEY_AVAILABLE:
+                    vc = getattr(self.sink, "voice_client", None)
+                    connection = getattr(vc, "_connection", None)
+                    dave_session = getattr(connection, "dave_session", None)
+                    user_id = self._cached_id
+                    if not user_id and vc and hasattr(vc, "_get_id_from_ssrc"):
+                        user_id = vc._get_id_from_ssrc(self.ssrc)
+
+                    if dave_session and user_id:
+                        try:
+                            raw_data = dave_session.decrypt(user_id, davey.MediaType.audio, raw_data)
+                        except Exception:
+                            pass
+
+                pcm = self._decoder.decode(raw_data, fec=False)
+                return packet, pcm
+            return _orig_decode_packet(self, packet)
+        except discord.opus.OpusError as err:
+            _decode_error_count += 1
+            if _decode_error_count <= 5:
+                logging.getLogger("recalled").warning("Packet decode OpusError (first %s): %s", _decode_error_count, err)
+            silence = b"\x00" * 3840
+            return packet, silence
+        except Exception as err:
+            _decode_error_count += 1
+            if _decode_error_count <= 5:
+                logging.getLogger("recalled").warning("Packet decode exception: %s", err)
+            silence = b"\x00" * 3840
+            return packet, silence
+
+    voice_recv_opus.PacketDecoder._decode_packet = _safe_decode_packet
+    VOICE_RECV_AVAILABLE = True
+except ImportError:
+    VOICE_RECV_AVAILABLE = False
+except Exception:
+    VOICE_RECV_AVAILABLE = True
+
+try:
+    import speech_recognition as sr
+    SPEECH_RECOGNITION_AVAILABLE = True
+except ImportError:
+    SPEECH_RECOGNITION_AVAILABLE = False
 
 
 load_dotenv()
@@ -24,6 +104,10 @@ DATABASE_FILE = Path(os.getenv("DATABASE_FILE", "recalled.db"))
 SEED_DATABASE_FILE = Path(os.getenv("SEED_DATABASE_FILE", "/app/seed/recalled.db"))
 LOG_FILE = Path(os.getenv("LOG_FILE", "recalled.log"))
 GUILD_ID = os.getenv("GUILD_ID")
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-GuyNeural")
+TTS_RATE = os.getenv("TTS_RATE", "+10%").strip()
+TTS_TEMP_DIR = Path(tempfile.gettempdir()) / "cordbot_tts"
+STT_ENGINE = os.getenv("STT_ENGINE", "google").strip().lower()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -306,7 +390,14 @@ sync_stop_requests: set[int] = set()
 response_filter = {"min_length": 0, "contains_text": ""}
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+if not discord.opus.is_loaded():
+    try:
+        discord.opus.load_opus("libopus.so.0")
+    except Exception:
+        pass
 
 
 @bot.event
@@ -314,15 +405,29 @@ async def setup_hook() -> None:
     if GUILD_ID:
         logger.info("Registering slash commands for guild %s.", GUILD_ID)
         guild = discord.Object(id=int(GUILD_ID))
-        bot.tree.clear_commands(guild=guild)
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
-        logger.info("Slash commands registered for guild %s.", GUILD_ID)
+        try:
+            bot.tree.clear_commands(guild=guild)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            logger.info("Slash commands registered for guild %s.", GUILD_ID)
+        except discord.Forbidden as error:
+            logger.error(
+                "Could not sync slash commands to guild %s: %s. "
+                "Ensure the bot was invited with the 'applications.commands' scope and is in the server.",
+                GUILD_ID,
+                error,
+            )
     else:
-        await bot.tree.sync()
-        logger.info("Slash commands registered globally.")
+        try:
+            await bot.tree.sync()
+            logger.info("Slash commands registered globally.")
+        except discord.Forbidden as error:
+            logger.error(
+                "Could not sync global slash commands: %s. Ensure the bot has 'applications.commands' scope.",
+                error,
+            )
 
 
 @bot.event
@@ -816,6 +921,627 @@ async def locate(interaction: discord.Interaction, message_id: str | None = None
         f"{reply_record['channel_id']}/{reply_record['source_message_id']}"
     )
     await interaction.response.send_message(f"Original message: {original_link}")
+
+
+# ---------------------------------------------------------------------------
+# Voice & TTS System (Independent of Text Chat Replies)
+# ---------------------------------------------------------------------------
+
+def clean_text_for_speech(text: str) -> str:
+    """Clean Discord messages (stripping URLs, emojis, markdown) for speech synthesis."""
+    cleaned = re.sub(r"https?://\S+|www\.\S+", "", text)
+    cleaned = re.sub(r"```[\s\S]*?```|`[^`]*`", "", cleaned)
+    cleaned = re.sub(r"<@[!&]?\d+>|<#\d+>|<a?:\w+:\d+>", "", cleaned)
+    cleaned = cleaned.replace("||", "")
+    cleaned = re.sub(r"[*_~`#>]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def select_voice_response(query: str = "") -> tuple[StoredMessage, str] | None:
+    """
+    Select an eligible recalled message suitable for speech.
+    Responds at random from eligible stored messages without doing heavy DB/query matching.
+    """
+    if not stored_messages:
+        return None
+
+    min_len = response_filter.get("min_length", 1)
+    contains = response_filter.get("contains_text")
+
+    # If query is explicitly provided (e.g. from /vc_test phrase="..."), try finding a matching candidate
+    if query:
+        query_words = message_words(query)
+        if query_words:
+            candidates: list[tuple[StoredMessage, str]] = []
+            for msg in stored_messages:
+                content = msg["content"]
+                if len(content) < min_len or (contains and contains not in content.casefold()):
+                    continue
+                if any(qw in content.casefold() for qw in query_words):
+                    cleaned = clean_text_for_speech(content)
+                    if len(cleaned) >= 2 and any(c.isalnum() for c in cleaned):
+                        candidates.append((msg, cleaned))
+                        if len(candidates) >= 50:
+                            break
+            if candidates:
+                return random.choice(candidates)
+
+    # Instant random selection: pick random messages until an eligible one with speakable content is found
+    for _ in range(50):
+        msg = random.choice(stored_messages)
+        content = msg["content"]
+        if len(content) < min_len:
+            continue
+        if contains and contains not in content.casefold():
+            continue
+        cleaned = clean_text_for_speech(content)
+        if len(cleaned) >= 2 and any(c.isalnum() for c in cleaned):
+            return msg, cleaned
+
+    return None
+
+
+async def synthesize_speech(text: str, voice: str = TTS_VOICE, rate: str = TTS_RATE) -> Path:
+    """Synthesize text into a temporary MP3 file using edge-tts."""
+    if not EDGE_TTS_AVAILABLE:
+        raise RuntimeError("The `edge-tts` package is not installed. Run `pip install edge-tts`.")
+
+    TTS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".mp3", dir=TTS_TEMP_DIR, delete=False) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
+    await communicate.save(str(temp_path))
+    return temp_path
+
+
+class VoiceQueueItem:
+    def __init__(self, audio_path: Path, text: str) -> None:
+        self.audio_path = audio_path
+        self.text = text
+
+
+class GuildVoiceManager:
+    """Manages sequential audio playback and queueing for a single guild."""
+
+    def __init__(self, guild_id: int) -> None:
+        self.guild_id = guild_id
+        self.queue: asyncio.Queue[VoiceQueueItem] = asyncio.Queue()
+        self.current_task: asyncio.Task | None = None
+        self.is_processing: bool = False
+
+    async def add(self, item: VoiceQueueItem, voice_client: discord.VoiceClient) -> None:
+        await self.queue.put(item)
+        if not self.is_processing:
+            self.current_task = asyncio.create_task(self._process_queue(voice_client))
+
+    async def _process_queue(self, voice_client: discord.VoiceClient) -> None:
+        self.is_processing = True
+        try:
+            while not self.queue.empty():
+                if not voice_client.is_connected():
+                    break
+                item = await self.queue.get()
+                play_done = asyncio.Event()
+
+                def after_playback(error: Exception | None) -> None:
+                    if error:
+                        logger.error("Voice playback error in guild %s: %s", self.guild_id, error)
+                    bot.loop.call_soon_threadsafe(play_done.set)
+
+                try:
+                    source = discord.FFmpegPCMAudio(
+                        str(item.audio_path),
+                        before_options="-nostdin -probesize 32768",
+                    )
+                    voice_client.play(source, after=after_playback)
+                    await play_done.wait()
+                except Exception as error:
+                    logger.error("Error playing audio item in guild %s: %s", self.guild_id, error)
+                finally:
+                    try:
+                        if item.audio_path.exists():
+                            item.audio_path.unlink()
+                    except OSError:
+                        pass
+                    self.queue.task_done()
+        finally:
+            self.is_processing = False
+
+    def clear(self) -> None:
+        if self.current_task and not self.current_task.done():
+            self.current_task.cancel()
+        while not self.queue.empty():
+            try:
+                item = self.queue.get_nowait()
+                if item.audio_path.exists():
+                    item.audio_path.unlink()
+            except Exception:
+                pass
+        self.is_processing = False
+
+
+voice_managers: dict[int, GuildVoiceManager] = {}
+
+
+def get_voice_manager(guild_id: int) -> GuildVoiceManager:
+    if guild_id not in voice_managers:
+        voice_managers[guild_id] = GuildVoiceManager(guild_id)
+    return voice_managers[guild_id]
+
+
+def clear_voice_queue(guild_id: int) -> None:
+    if guild_id in voice_managers:
+        voice_managers[guild_id].clear()
+        del voice_managers[guild_id]
+
+
+async def play_tts(guild: discord.Guild, text: str) -> bool:
+    """Synthesize text and enqueue it for playback in the guild's voice channel."""
+    voice_client: discord.VoiceClient | None = guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        logger.warning("Cannot play TTS in guild %s: bot is not connected to a voice channel.", guild.id)
+        return False
+
+    cleaned = clean_text_for_speech(text)
+    if not cleaned:
+        logger.warning("TTS skipped: text has no speakable content after cleaning.")
+        return False
+
+    try:
+        audio_path = await synthesize_speech(cleaned)
+    except Exception as error:
+        logger.error("Failed to synthesize speech for %r: %s", cleaned, error)
+        return False
+
+    manager = get_voice_manager(guild.id)
+    await manager.add(VoiceQueueItem(audio_path=audio_path, text=cleaned), voice_client)
+    logger.info("Enqueued TTS for playback in guild %s: %r", guild.id, cleaned)
+    return True
+
+
+async def speak_response(guild: discord.Guild, query: str = "") -> str | None:
+    """
+    Select an appropriate stored message and speak it in the voice channel.
+    Designed for use with speech recognition (STT) when the trigger is spoken in VC.
+    Does NOT output anything to text channels.
+    """
+    voice_client: discord.VoiceClient | None = guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        logger.warning("speak_response called for guild %s, but bot is not in a voice channel.", guild.id)
+        return None
+
+    selection = select_voice_response(query)
+    if not selection:
+        logger.info("No suitable message found to speak in voice.")
+        return None
+
+    msg, speech_text = selection
+    logger.info("Selected voice response (source message %s): %r", msg["id"], speech_text)
+    success = await play_tts(guild, speech_text)
+    if success:
+        return speech_text
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Speech-to-Text (STT) Recognition System
+# ---------------------------------------------------------------------------
+
+if SPEECH_RECOGNITION_AVAILABLE and VOICE_RECV_AVAILABLE:
+
+    class DiscordSRAudioSource(sr.AudioSource):
+        """Audio source bridging raw PCM from Discord into speech_recognition."""
+
+        little_endian = True
+        SAMPLE_RATE = 48_000
+        SAMPLE_WIDTH = 2
+        CHANNELS = 2
+        CHUNK = 960
+
+        def __init__(self, buffer: array.array) -> None:
+            self.buffer = buffer
+            self._entered = False
+
+        @property
+        def stream(self):
+            return self
+
+        def __enter__(self):
+            self._entered = True
+            return self
+
+        def __exit__(self, *exc) -> None:
+            self._entered = False
+
+        def read(self, size: int) -> bytes:
+            bytes_needed = size * self.CHANNELS * self.SAMPLE_WIDTH
+            silence_mono = b"\x00" * (size * self.SAMPLE_WIDTH)
+
+            if len(self.buffer) < bytes_needed:
+                time.sleep(0.005)
+
+            if len(self.buffer) < bytes_needed:
+                # Return silence frames when no voice data is pending to prevent EOF in SpeechRecognition
+                return silence_mono
+
+            audiochunk = self.buffer[:bytes_needed].tobytes()
+            del self.buffer[: min(bytes_needed, len(audiochunk))]
+
+            if AUDIOOP_AVAILABLE and len(audiochunk) >= self.CHANNELS * self.SAMPLE_WIDTH:
+                try:
+                    return audioop.tomono(audiochunk, self.SAMPLE_WIDTH, 0.5, 0.5)
+                except Exception:
+                    pass
+            # Fallback to mono: take left 16-bit channel safely
+            try:
+                return array.array("h", audiochunk)[0::2].tobytes()
+            except Exception:
+                return audiochunk[0::2]
+
+        def close(self) -> None:
+            del self.buffer[:]
+
+    class BotSpeechRecognitionSink(voice_recv.AudioSink):
+        """Audio sink receiving PCM streams per user and transcribing with SpeechRecognition."""
+
+        def __init__(
+            self,
+            *,
+            text_cb: Callable[[discord.Member | int, str], None],
+            default_recognizer: str = "google",
+            phrase_time_limit: int = 8,
+        ) -> None:
+            super().__init__(None)
+            self.text_cb = text_cb
+            self.default_recognizer = default_recognizer
+            self.phrase_time_limit = phrase_time_limit
+            self._stream_data: dict[int, dict] = defaultdict(self._new_stream_data)
+
+        def _new_stream_data(self) -> dict:
+            rec = sr.Recognizer()
+            rec.energy_threshold = 200
+            rec.dynamic_energy_threshold = False
+            rec.pause_threshold = 0.45
+            rec.phrase_threshold = 0.2
+            rec.non_speaking_duration = 0.25
+            return {
+                "stopper": None,
+                "recognizer": rec,
+                "buffer": array.array("B"),
+            }
+
+        def wants_opus(self) -> bool:
+            return False
+
+        def write(self, user: discord.Member | None, data: voice_recv.VoiceData) -> None:
+            if isinstance(data.packet, voice_recv.SilencePacket):
+                return
+
+            voice_client = self.voice_client
+            ssrc = data.packet.ssrc if data.packet else 0
+
+            # If user is not provided by cache, try resolving from voice client SSRC or voice channel
+            if user is None and voice_client:
+                user_id = voice_client._get_id_from_ssrc(ssrc)
+                if user_id:
+                    user = voice_client.guild.get_member(user_id)
+                    if not user and voice_client.channel:
+                        for member in voice_client.channel.members:
+                            if member.id == user_id:
+                                user = member
+                                break
+
+            # If still None, look for any non-bot member in the current voice channel
+            if user is None and voice_client and voice_client.channel:
+                human_members = [m for m in voice_client.channel.members if not m.bot]
+                if len(human_members) == 1:
+                    user = human_members[0]
+
+            # Ignore audio from bot accounts
+            if user and user.bot:
+                return
+
+            stream_key = user.id if user else ssrc
+            sdata = self._stream_data[stream_key]
+            if data.pcm:
+                sdata["buffer"].extend(data.pcm)
+
+            if not sdata["stopper"]:
+                speaker = user or stream_key
+                logger.info("Initializing speech recognizer listener for %s (stream key %s)", speaker, stream_key)
+                sdata["stopper"] = sdata["recognizer"].listen_in_background(
+                    DiscordSRAudioSource(sdata["buffer"]),
+                    self._background_listener(speaker),
+                    phrase_time_limit=self.phrase_time_limit,
+                )
+
+        def _background_listener(self, user_or_key: discord.Member | int):
+            speaker_name = user_or_key.display_name if isinstance(user_or_key, discord.Member) else f"User {user_or_key}"
+
+            def callback(recognizer: sr.Recognizer, audio: sr.AudioData) -> None:
+                text: str | None = None
+                try:
+                    recognize_func = getattr(
+                        recognizer,
+                        f"recognize_{self.default_recognizer}",
+                        recognizer.recognize_google,
+                    )
+                    text = recognize_func(audio)
+                except sr.UnknownValueError:
+                    # Silence or unrecognizable sound
+                    return
+                except Exception as error:
+                    logger.warning("Speech recognition API error for %s: %s", speaker_name, error)
+                    return
+
+                if text:
+                    logger.info("Speech detected from %s: %r", speaker_name, text)
+                    try:
+                        self.text_cb(user_or_key, text)
+                    except Exception as error:
+                        logger.error("Error in speech recognition text callback: %s", error)
+
+            return callback
+
+        def cleanup(self) -> None:
+            for user_id in tuple(self._stream_data.keys()):
+                self._drop(user_id)
+
+        def _drop(self, user_id: int) -> None:
+            data = self._stream_data.pop(user_id, None)
+            if not data:
+                return
+            stopper = data.get("stopper")
+            if stopper:
+                try:
+                    stopper()
+                except Exception:
+                    pass
+            buf = data.get("buffer")
+            if buf:
+                del buf[:]
+
+
+def keyword_matches_vc(text: str) -> bool:
+    """Check if the trigger keyword (or accepted variants like 'jessie') was spoken in voice chat."""
+    if not text:
+        return False
+
+    text_lower = text.casefold()
+
+    # 1. Direct substring check for KEYWORD and explicitly 'jessie'
+    if KEYWORD in text_lower or "jessie" in text_lower:
+        return True
+
+    # 2. Known phonetic/homophone/spelling variants for common keywords
+    known_variants: dict[str, set[str]] = {
+        "jesse": {"jessie", "jessy", "jessee", "jess", "jessi"},
+    }
+    accepted_words = set(known_variants.get(KEYWORD, set()))
+    accepted_words.add(KEYWORD)
+    accepted_words.add("jessie")
+
+    # 3. Word token matching
+    words = [w.strip("'\".,!?") for w in re.findall(r"[a-z0-9']+", text_lower)]
+    for word in words:
+        if word in accepted_words:
+            return True
+
+    # 4. Fuzzy word similarity (ratio >= 0.82)
+    # Threshold 0.82 matches 'jessie' (0.91), 'jess' (0.89) while avoiding false positives like 'jesus' (0.80)
+    for word in words:
+        if len(word) >= 3:
+            for target in accepted_words:
+                if SequenceMatcher(None, target, word).ratio() >= 0.82:
+                    return True
+
+    return False
+
+
+def setup_stt_listener(voice_client: discord.VoiceClient) -> bool:
+    """Attach the speech recognition sink to a VoiceRecvClient."""
+    if not VOICE_RECV_AVAILABLE or not SPEECH_RECOGNITION_AVAILABLE:
+        logger.warning("Voice receive or SpeechRecognition is not installed. Speech detection disabled.")
+        return False
+
+    if not isinstance(voice_client, voice_recv.VoiceRecvClient):
+        logger.warning("Voice client is not a VoiceRecvClient; cannot listen for speech.")
+        return False
+
+    if voice_client.is_listening():
+        return True
+
+    def on_speech_recognized(user_or_key: discord.Member | int, text: str) -> None:
+        if not text or not text.strip():
+            return
+        if isinstance(user_or_key, discord.Member) and user_or_key.bot:
+            return
+        if voice_client.is_playing():
+            logger.debug("Speech ignored while bot is currently playing audio: %r", text)
+            return
+
+        speaker_name = user_or_key.display_name if isinstance(user_or_key, discord.Member) else f"User {user_or_key}"
+        logger.info("Transcribed from %s: %r", speaker_name, text)
+
+        # Check if the trigger keyword ("jesse", "jessie", or variants) was spoken
+        if keyword_matches_vc(text):
+            logger.info("Keyword matched in speech from %s (%r)! Triggering random voice response.", speaker_name, text)
+            asyncio.run_coroutine_threadsafe(
+                speak_response(voice_client.guild),
+                bot.loop,
+            )
+        else:
+            logger.info("Heard speech from %s: %r (keyword %r / 'jessie' not matched)", speaker_name, text, KEYWORD)
+
+    sink = BotSpeechRecognitionSink(
+        text_cb=on_speech_recognized,
+        default_recognizer=STT_ENGINE,
+    )
+    voice_client.listen(sink)
+    logger.info("Started speech recognition listener in guild %s using engine '%s'.", voice_client.guild.id, STT_ENGINE)
+    return True
+
+
+@bot.tree.command(name="vc", description="Make the bot join your current voice channel and listen for speech")
+@discord.app_commands.guild_only()
+async def vc_join(interaction: discord.Interaction) -> None:
+    """Connect the bot to the voice channel the user is currently in."""
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message(
+            "You need to be connected to a voice channel to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.user.voice.channel
+    guild = interaction.guild
+    if guild is None or guild.me is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    permissions = channel.permissions_for(guild.me)
+    if not permissions.connect or not permissions.speak:
+        await interaction.response.send_message(
+            f"I do not have permission to connect and speak in {channel.mention}.",
+            ephemeral=True,
+        )
+        return
+
+    connect_cls = voice_recv.VoiceRecvClient if VOICE_RECV_AVAILABLE else discord.VoiceClient
+    voice_client: discord.VoiceClient | None = guild.voice_client
+
+    if voice_client:
+        if voice_client.channel.id == channel.id:
+            await interaction.response.send_message(
+                f"I'm already in {channel.mention}!",
+                ephemeral=True,
+            )
+            return
+        await voice_client.move_to(channel)
+        await interaction.response.send_message(f"Moved to {channel.mention}.")
+        logger.info("Moved to voice channel %s (%s) in guild %s.", channel.name, channel.id, guild.id)
+    else:
+        voice_client = await channel.connect(cls=connect_cls)
+        await interaction.response.send_message(f"Joined {channel.mention}.")
+        logger.info("Joined voice channel %s (%s) in guild %s.", channel.name, channel.id, guild.id)
+
+    if VOICE_RECV_AVAILABLE and SPEECH_RECOGNITION_AVAILABLE:
+        setup_stt_listener(voice_client)
+
+
+@bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
+@discord.app_commands.guild_only()
+async def vc_leave(interaction: discord.Interaction) -> None:
+    """Disconnect the bot from the current voice channel."""
+    guild = interaction.guild
+    if guild is None or not guild.voice_client:
+        await interaction.response.send_message("I am not connected to any voice channel.", ephemeral=True)
+        return
+
+    voice_client = guild.voice_client
+    if VOICE_RECV_AVAILABLE and isinstance(voice_client, voice_recv.VoiceRecvClient):
+        if voice_client.is_listening():
+            voice_client.stop_listening()
+
+    clear_voice_queue(guild.id)
+    await voice_client.disconnect()
+    await interaction.response.send_message("Disconnected from the voice channel.")
+    logger.info("Disconnected from voice in guild %s.", guild.id)
+
+
+@bot.tree.command(name="stt", description="Check or toggle voice speech detection")
+@discord.app_commands.describe(enabled="Enable or disable listening for speech in voice")
+@discord.app_commands.guild_only()
+async def stt_command(interaction: discord.Interaction, enabled: bool | None = None) -> None:
+    """Check or toggle speech recognition in the connected voice channel."""
+    guild = interaction.guild
+    if guild is None or not guild.voice_client:
+        await interaction.response.send_message("The bot is not currently connected to a voice channel.", ephemeral=True)
+        return
+
+    voice_client = guild.voice_client
+    if not VOICE_RECV_AVAILABLE or not SPEECH_RECOGNITION_AVAILABLE:
+        await interaction.response.send_message(
+            "Speech detection is unavailable because `discord-ext-voice-recv` or `SpeechRecognition` is not installed.\n"
+            "Run `pip install discord-ext-voice-recv SpeechRecognition` to enable it.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(voice_client, voice_recv.VoiceRecvClient):
+        await interaction.response.send_message("Voice client was not connected with voice receiving support.", ephemeral=True)
+        return
+
+    if enabled is None:
+        status = "Active and listening" if voice_client.is_listening() else "Stopped / Idle"
+        await interaction.response.send_message(
+            f"Speech detection status: **{status}**\n"
+            f"Trigger keyword: `{KEYWORD}`\n"
+            f"Engine: `{STT_ENGINE}`",
+            ephemeral=True,
+        )
+        return
+
+    if enabled:
+        if voice_client.is_listening():
+            await interaction.response.send_message("Speech detection is already active and listening.", ephemeral=True)
+        else:
+            setup_stt_listener(voice_client)
+            await interaction.response.send_message("Speech detection enabled! Listening for speech in VC.", ephemeral=True)
+    else:
+        if voice_client.is_listening():
+            voice_client.stop_listening()
+            await interaction.response.send_message("Speech detection paused.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Speech detection is already paused.", ephemeral=True)
+
+
+@bot.tree.command(name="vc_test", description="Test voice response in the connected voice channel")
+@discord.app_commands.describe(
+    phrase="Optional query/topic to test matching, or leave empty for a random response",
+    custom_text="Optional custom text to speak directly instead of picking a recalled message",
+)
+@discord.app_commands.guild_only()
+async def vc_test(
+    interaction: discord.Interaction,
+    phrase: str | None = None,
+    custom_text: str | None = None,
+) -> None:
+    """Test the TTS and voice response system."""
+    guild = interaction.guild
+    if guild is None or not guild.voice_client or not guild.voice_client.is_connected():
+        await interaction.response.send_message(
+            "The bot is not currently in a voice channel. Use `/vc` first!",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if custom_text:
+        success = await play_tts(guild, custom_text)
+        if success:
+            await interaction.followup.send(f"Speaking custom text: \"{custom_text}\"", ephemeral=True)
+        else:
+            await interaction.followup.send("Failed to generate or play speech.", ephemeral=True)
+        return
+
+    spoken = await speak_response(guild, phrase or "")
+    if spoken:
+        await interaction.followup.send(f"Spoke response for \"{phrase or 'random'}\": \"{spoken}\"", ephemeral=True)
+    else:
+        await interaction.followup.send("Could not find a suitable stored response to speak.", ephemeral=True)
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+) -> None:
+    if member == bot.user and before.channel and not after.channel:
+        clear_voice_queue(member.guild.id)
+        logger.info("Bot was disconnected from voice channel in guild %s; cleared voice queue.", member.guild.id)
 
 
 @bot.event
